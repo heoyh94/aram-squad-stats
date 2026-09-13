@@ -20,6 +20,11 @@ import { getAugmentHighlight, getAugmentName } from '@/lib/augmentHighlight'
 import { getGameCommentary } from '@/lib/gameCommentary'
 import { analyzeTeamComposition } from '@/lib/teamInsights'
 import {
+  changedAwards,
+  primeAwardAudio,
+  type AwardChanges,
+} from '@/lib/awardAudio'
+import {
   displayDate,
   duration,
   gameHref,
@@ -61,6 +66,13 @@ function getAuto() {
   }
 }
 const serverAuto = () => false
+function getSound() {
+  try {
+    return localStorage.getItem('aram:award-sound') !== 'off'
+  } catch {
+    return false
+  }
+}
 
 function MatchCard({
   game,
@@ -280,10 +292,23 @@ export default function DashboardClient({
     }),
     [best, championNames, trend, playerName],
   )
-  const [celebration, setCelebration] = useState<'auto' | 'manual' | null>(null)
+  const [celebration, setCelebration] = useState<
+    (AwardChanges & { mode: 'auto' | 'manual' }) | null
+  >(null)
   const [receipt, setReceipt] = useState(false)
   const auto = useSyncExternalStore(subscribePrefs, getAuto, serverAuto)
+  const sound = useSyncExternalStore(subscribePrefs, getSound, serverAuto)
   const closeCelebration = useCallback(() => setCelebration(null), [])
+  useEffect(() => {
+    if (!sound) return
+    const prime = () => primeAwardAudio()
+    document.addEventListener('click', prime)
+    document.addEventListener('keydown', prime)
+    return () => {
+      document.removeEventListener('click', prime)
+      document.removeEventListener('keydown', prime)
+    }
+  }, [sound])
   useEffect(() => {
     if (
       !auto ||
@@ -295,19 +320,21 @@ export default function DashboardClient({
     )
       return
     const key = `${date}:${best.id}:${trend?.anchor.puuid ?? ''}`
+    let changes: AwardChanges
     try {
-      if (localStorage.getItem('aram:shown-awards-v2') === key) return
+      changes = changedAwards(localStorage.getItem('aram:shown-awards-v2'), key)
+      if (!changes.mvp && !changes.anchor) return
     } catch {
       return
     }
     let cancelled = false
     const timer = window.setTimeout(() => {
       preloadImages([
-        subjects.mvp?.photoUrl ?? null,
-        subjects.anchor?.photoUrl ?? null,
+        changes.mvp ? (subjects.mvp?.photoUrl ?? null) : null,
+        changes.anchor ? (subjects.anchor?.photoUrl ?? null) : null,
       ]).then(() => {
         if (cancelled) return
-        setCelebration('auto')
+        setCelebration({ mode: 'auto', ...changes })
         try {
           localStorage.setItem('aram:shown-awards-v2', key)
         } catch {
@@ -348,15 +375,27 @@ export default function DashboardClient({
       /* Optional preference. */
     }
   }
+  function toggleSound() {
+    if (!sound) primeAwardAudio()
+    try {
+      localStorage.setItem('aram:award-sound', sound ? 'off' : 'on')
+      window.dispatchEvent(new Event('aram-prefs'))
+    } catch {
+      /* Optional preference. */
+    }
+  }
   const previous = dates.filter((day) => day < date).at(-1)
   const next = dates.find((day) => day > date)
   return (
     <div className="dashboard space-y-7">
       {celebration && (
         <MvpCelebration
-          {...subjects}
+          mvp={celebration.mvp ? subjects.mvp : null}
+          anchor={celebration.anchor ? subjects.anchor : null}
           onClose={closeCelebration}
-          autoClose={celebration === 'auto'}
+          autoClose={celebration.mode === 'auto'}
+          soundEnabled={sound}
+          onToggleSound={toggleSound}
           dateLabel={displayDate(date)}
         />
       )}
@@ -534,7 +573,10 @@ export default function DashboardClient({
           <div className="award-controls">
             <button
               className="award-replay"
-              onClick={() => setCelebration('manual')}
+              onClick={() => {
+                if (sound) primeAwardAudio()
+                setCelebration({ mode: 'manual', mvp: true, anchor: true })
+              }}
             >
               <span className="replay-icon" aria-hidden="true">
                 <svg viewBox="0 0 24 24" fill="currentColor">
@@ -562,6 +604,15 @@ export default function DashboardClient({
                 type="checkbox"
                 checked={auto}
                 onChange={toggleAuto}
+              />
+            </label>
+            <label className="auto-celebration-setting">
+              <span>시상식 효과음</span>
+              <input
+                className="app-switch"
+                type="checkbox"
+                checked={sound}
+                onChange={toggleSound}
               />
             </label>
             <ScoreHelp />

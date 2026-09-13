@@ -2,9 +2,10 @@
 
 import { useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
+import { AWARD_VISIBLE_MS, playAwardAudio } from '@/lib/awardAudio'
 
 /** 모달이 저절로 닫히기까지의 시간. */
-const VISIBLE_MS = 2000
+const VISIBLE_MS = AWARD_VISIBLE_MS
 
 /**
  * 이미지를 기다려 주는 상한.
@@ -75,6 +76,8 @@ export interface CelebrationProps {
   onClose: () => void
   autoClose?: boolean
   dateLabel?: string
+  soundEnabled?: boolean
+  onToggleSound?: () => void
   /** 갱신된 MVP. 변동 없으면 null */
   mvp: AwardSubject | null
   /** 갱신된 걸배이. 변동 없으면 null */
@@ -328,11 +331,17 @@ export default function MvpCelebration({
   anchor,
   autoClose = true,
   dateLabel,
+  soundEnabled = false,
+  onToggleSound,
 }: CelebrationProps) {
   const dialogRef = useRef<HTMLDialogElement>(null)
+  const openedAt = useRef(0)
+  const hasMvp = Boolean(mvp)
+  const hasAnchor = Boolean(anchor)
   useEffect(() => {
     const dialog = dialogRef.current
     dialog?.showModal()
+    openedAt.current = performance.now()
     const timer = autoClose ? window.setTimeout(onClose, VISIBLE_MS) : undefined
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === 'Escape') onClose()
@@ -351,6 +360,21 @@ export default function MvpCelebration({
       document.body.style.overflow = previousOverflow
     }
   }, [onClose, autoClose])
+  useEffect(() => {
+    if (!soundEnabled) return
+    const remaining = autoClose
+      ? VISIBLE_MS - (performance.now() - openedAt.current)
+      : VISIBLE_MS
+    const stop = playAwardAudio({ mvp: hasMvp, anchor: hasAnchor }, remaining)
+    const onVisibility = () => {
+      if (document.hidden) stop()
+    }
+    document.addEventListener('visibilitychange', onVisibility)
+    return () => {
+      stop()
+      document.removeEventListener('visibilitychange', onVisibility)
+    }
+  }, [hasMvp, hasAnchor, soundEnabled, autoClose])
 
   if (!mvp && !anchor) return null
   const solo = !mvp || !anchor
@@ -382,6 +406,19 @@ export default function MvpCelebration({
     >
       <div className="celebration-toolbar">
         <span>{dateLabel}</span>
+        {onToggleSound && (
+          <button
+            className="celebration-sound"
+            aria-label="시상식 효과음"
+            aria-pressed={soundEnabled}
+            onClick={(event) => {
+              event.stopPropagation()
+              onToggleSound()
+            }}
+          >
+            {soundEnabled ? '소리 켜짐' : '소리 꺼짐'}
+          </button>
+        )}
         <button aria-label="시상식 닫기" onClick={onClose}>
           닫기 ×
         </button>

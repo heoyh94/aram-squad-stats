@@ -2457,6 +2457,17 @@ a.button-secondary:active {
   color: #4c5c73;
   cursor: pointer;
 }
+.auto-celebration-setting + .auto-celebration-setting {
+  border-top: 1px solid #e8edf5;
+}
+.celebration-toolbar .celebration-sound {
+  margin-left: auto;
+  white-space: nowrap;
+  padding: 8px 10px;
+  min-height: 44px;
+  border: 1px solid #ffffff30;
+  border-radius: 12px;
+}
 input.app-switch {
   appearance: none;
   -webkit-appearance: none;
