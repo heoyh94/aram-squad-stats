@@ -59,7 +59,12 @@ exit /b 1
 :: ---- 실행 --------------------------------------------------------------
 :run
 echo.
-%PY% lcu_agent.py
+%PY% lcu_agent.py %*
+if errorlevel 1 (
+  echo 동기화 실패. 위의 오류 메시지를 확인해주세요.
+  pause
+  exit /b 1
+)
 echo.
-echo  완료! 이 창은 5초 후 자동으로 닫힙니다.
-timeout /t 5 >nul
+echo  완료! 이 창은 2초 후 자동으로 닫힙니다.
+timeout /t 2 >nul

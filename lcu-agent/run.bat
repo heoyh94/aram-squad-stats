@@ -52,7 +52,12 @@ exit /b 1
 
 :: ---- run ---------------------------------------------------------------
 :run
-%PY% lcu_agent.py
+%PY% lcu_agent.py %*
+if errorlevel 1 (
+  echo Sync failed. Check the message above.
+  pause
+  exit /b 1
+)
 echo.
-echo Done! Closing in 5 seconds...
-timeout /t 5 >nul
+echo Done! Closing in 2 seconds...
+timeout /t 2 >nul

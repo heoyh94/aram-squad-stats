@@ -131,16 +131,18 @@ export async function POST(request: NextRequest) {
       const ourTeamId = [...teamCounts.entries()].sort((a, b) => b[1] - a[1])[0][0]
       const ourTeamWin = trackedParticipants.find((p) => p.teamId === ourTeamId)?.win ?? false
 
-      // 기존 게임은 결과가 비어 있을 때만 복구하고, 결과가 있으면 건너뛴다.
+      // 4명 결과가 모두 있으면 건너뛰고, 일부만 저장됐으면 누락 선수만 복구한다.
       const existingGameId = existingByMatchId.get(game.gameId)
+      let savedPlayerIds = new Set<string>()
       let gameId: string
       if (existingGameId) {
-        const { count, error: countError } = await supabase
+        const { data: savedResults, error: countError } = await supabase
           .from('game_results')
-          .select('id', { count: 'exact', head: true })
+          .select('player_id')
           .eq('game_id', existingGameId)
         if (countError) { errors.push(`${game.gameId}: ${countError.message}`); continue }
-        if ((count ?? 0) > 0) { skipped++; continue }
+        savedPlayerIds = new Set((savedResults ?? []).map(row => row.player_id))
+        if ([...playerIdMap.values()].every(id => savedPlayerIds.has(id))) { skipped++; continue }
         gameId = existingGameId
       } else {
         const { data: insertedGame, error: gameErr } = await supabase
@@ -223,7 +225,9 @@ export async function POST(request: NextRequest) {
         continue
       }
 
-      const { error: resultsError } = await supabase.from('game_results').insert(resultRows)
+      const { error: resultsError } = await supabase.from('game_results').insert(
+        resultRows.filter(row => !savedPlayerIds.has(row.player_id)),
+      )
       if (resultsError) {
         // 결과 없는 게임 행을 남기면 다음 동기화가 "이미 저장됨"으로 건너뛴다.
         if (!existingGameId) await supabase.from('games').delete().eq('id', gameId)

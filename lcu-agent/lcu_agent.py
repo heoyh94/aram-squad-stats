@@ -17,6 +17,7 @@ import re
 import json
 import base64
 import argparse
+import time
 from pathlib import Path
 
 try:
@@ -32,7 +33,7 @@ except ImportError as exc:
 # ─── 설정 ────────────────────────────────────────────────────────────────────
 
 SERVER_URL      = "https://aram4.vercel.app/api/lcu-sync"
-LAST_SYNC_URL   = "https://aram4.vercel.app/api/last-sync"
+STATUS_URL      = "https://aram4.vercel.app/api/lcu-sync/status"
 LCU_SECRET  = os.environ.get("LCU_SYNC_SECRET", "")  # 환경변수 or 직접 입력
 QUEUE_ID    = 2400   # ARAM Mayhem
 
@@ -103,6 +104,7 @@ def parse_lockfile(path: Path) -> dict:
 def lcu_session(port: str, password: str) -> requests.Session:
     """LCU 전용 requests 세션 (SSL 무시, Basic 인증)"""
     s = requests.Session()
+    s.trust_env = False  # localhost LCU must not go through a system proxy
     s.verify = False
     token = base64.b64encode(f"riot:{password}".encode()).decode()
     s.headers.update({
@@ -157,9 +159,13 @@ def get_match_history(session: requests.Session, puuid: str, count: int = 200) -
         try:
             data = lcu_get(session, ep)
             if isinstance(data, dict):
-                return data.get('games', {}).get('games', data.get('games', []))
+                games = data.get('games', [])
+                if isinstance(games, dict):
+                    games = games.get('games', [])
+                if isinstance(games, list):
+                    return games[:count]
             if isinstance(data, list):
-                return data
+                return data[:count]
         except Exception as e:
             print(f"  endpoint {ep} 실패: {e}")
     return []
@@ -179,6 +185,23 @@ def get_game_detail(session: requests.Session, game_id: int) -> dict:
         except Exception as e:
             print(f"  game detail {ep} 실패: {e}")
     return {}
+
+
+def get_completed_match_ids(session: requests.Session, games: list, secret: str) -> set:
+    """Only server-confirmed four-player results can skip the expensive detail call."""
+    ids = [f'OC1_{game["gameId"]}' for game in games]
+    if not ids:
+        return set()
+    response = session.post(STATUS_URL, json={'secret': secret, 'match_ids': ids}, timeout=(5, 10))
+    response.raise_for_status()
+    completed = response.json().get('complete_match_ids')
+    if not isinstance(completed, list) or not all(isinstance(value, str) for value in completed):
+        raise ValueError('서버 저장 상태 응답 형식 오류')
+    return set(completed) & set(ids)
+
+
+def pending_games(games: list, completed: set) -> list:
+    return [game for game in games if f'OC1_{game["gameId"]}' not in completed]
 
 
 def normalize_game_detail(raw: dict) -> dict:
@@ -450,26 +473,16 @@ def main():
         run_debug(session, puuid)
         return
 
-    # 4. 마지막 저장 시점 조회
-    print("[4] 마지막 저장 시점 확인...")
-    last_game_creation = 0
-    try:
-        r = requests.get(LAST_SYNC_URL, timeout=10)
-        data = r.json()
-        if data.get('last_played_at'):
-            from datetime import datetime, timezone
-            dt = datetime.fromisoformat(data['last_played_at'].replace('Z', '+00:00'))
-            last_game_creation = int(dt.timestamp() * 1000)
-            print(f"  마지막 저장: {data['last_played_at'][:10]} ({data['last_match_id']})")
-        else:
-            print("  저장된 게임 없음 → 전체 조회")
-    except Exception as e:
-        print(f"  확인 실패 ({e}) → 전체 조회")
+    if not LCU_SECRET:
+        print("\n✗ LCU_SYNC_SECRET 환경변수가 설정되지 않았습니다.")
+        sys.exit(1)
+    server_session = requests.Session()
 
     # 5. 매치 히스토리
-    print(f"[5] 매치 히스토리 조회 (최근 {fetch_count}경기)...")
+    print(f"[4] 매치 히스토리 조회 (최근 {fetch_count}경기)...")
+    stage_start = time.perf_counter()
     raw_games = get_match_history(session, puuid, fetch_count)
-    print(f"  전체 {len(raw_games)}경기")
+    print(f"  전체 {len(raw_games)}경기 · {time.perf_counter() - stage_start:.1f}초")
 
     # 6. Mayhem 필터 → 최근 경기 재검사 → game detail → 4인 확인
     # 서버가 game_results가 비어 있는 기존 games를 복구할 수 있으므로
@@ -477,13 +490,31 @@ def main():
     games_payload = []
     mayhem_games = [g for g in raw_games
                     if int(g.get('queueId', g.get('queue', {}).get('id', -1))) == QUEUE_ID]
-    print(f"  Mayhem 경기: {len(mayhem_games)}개 (기존 빈 결과 복구 포함)")
+    print(f"  Mayhem 경기: {len(mayhem_games)}개")
+    print("[5] 서버 저장 완료 경기 확인...")
+    stage_start = time.perf_counter()
+    completed = set()
+    try:
+        completed = get_completed_match_ids(server_session, mayhem_games, LCU_SECRET)
+    except requests.HTTPError as error:
+        if error.response is not None and error.response.status_code in (401, 403):
+            print("  ✗ 동기화 인증 실패. LCU_SYNC_SECRET을 확인해주세요.")
+            sys.exit(1)
+        print("  저장 확인 실패 → 누락 방지를 위해 기존 방식으로 재검사합니다.")
+    except (requests.RequestException, ValueError):
+        print("  저장 확인 실패 → 누락 방지를 위해 기존 방식으로 재검사합니다.")
+    candidates = pending_games(mayhem_games, completed)
+    print(f"  저장 완료 {len(completed)}경기 생략 · 확인 {time.perf_counter() - stage_start:.1f}초")
+    print(f"[6] 미저장 경기 상세 조회 ({len(candidates)}경기)...")
+    stage_start = time.perf_counter()
+    collection_errors = []
 
-    for raw in mayhem_games:
+    for raw in candidates:
         game_id = raw.get('gameId')
         detail = get_game_detail(session, game_id)
         if not detail:
             print(f"  skip OC1_{game_id} (game detail 조회 실패)")
+            collection_errors.append(f'OC1_{game_id}: 경기 상세 조회 실패, 다시 실행해주세요.')
             continue
 
         # 4명 다 있는지 LCU puuid 기준 확인
@@ -500,7 +531,7 @@ def main():
         games_payload.append(norm)
         print(f"  ✓ OC1_{game_id} 포함")
 
-    print(f"  Mayhem 4인 게임: {len(games_payload)}경기")
+    print(f"  Mayhem 4인 게임: {len(games_payload)}경기 · 조회 {time.perf_counter() - stage_start:.1f}초")
 
     # payload 샘플 출력 (디버그용)
     if games_payload:
@@ -511,30 +542,31 @@ def main():
                 print(f"    {p['gameName']} | puuid:{p['puuid'][:20]}... | {p['kills']}/{p['deaths']}/{p['assists']}")
 
     if not games_payload:
-        print("  전송할 게임 없음.")
+        if collection_errors:
+            print(f"errors: {collection_errors}")
+            sys.exit(1)
+        print("  새로 전송할 게임 없음.")
+        print("  방금 끝난 경기가 없다면 롤 클라이언트 전적에 나타난 뒤 다시 실행해주세요.")
         return
 
-    # 6. 서버 전송 (배치로 나눠서)
-    if not LCU_SECRET:
-        print("\n✗ LCU_SYNC_SECRET 환경변수가 설정되지 않았습니다.")
-        print("  set LCU_SYNC_SECRET=your-secret 후 재실행하세요.")
-        sys.exit(1)
-
+    # 7. 서버 전송 (배치로 나눠서)
     BATCH_SIZE = 3
     total_synced = 0
     total_skipped = 0
-    total_errors = []
+    total_errors = list(collection_errors)
 
     batches = [games_payload[i:i+BATCH_SIZE] for i in range(0, len(games_payload), BATCH_SIZE)]
-    print(f"[5] 서버 전송 ({len(batches)}배치 × {BATCH_SIZE}경기씩)...")
+    print(f"[7] 서버 전송 ({len(batches)}배치 × {BATCH_SIZE}경기씩)...")
 
     for i, batch in enumerate(batches):
         print(f"  배치 {i+1}/{len(batches)} ({len(batch)}경기)...", end=' ', flush=True)
+        stage_start = time.perf_counter()
         try:
-            resp = requests.post(SERVER_URL, json={
+            resp = server_session.post(SERVER_URL, json={
                 'secret': LCU_SECRET,
                 'games': batch,
             }, timeout=60)
+            resp.raise_for_status()
             result = resp.json()
             synced  = result.get('synced', 0)
             skipped = result.get('skipped', 0)
@@ -542,7 +574,7 @@ def main():
             total_synced  += synced
             total_skipped += skipped
             total_errors  += errors
-            print(f"✓ synced:{synced} skipped:{skipped} HTTP:{resp.status_code}")
+            print(f"{'⚠' if errors else '✓'} synced:{synced} skipped:{skipped} HTTP:{resp.status_code} · {time.perf_counter() - stage_start:.1f}초")
             if errors:
                 print(f"    errors: {errors[:3]}")
         except Exception as e:
@@ -552,7 +584,13 @@ def main():
     print(f"\n완료! 총 synced:{total_synced} / skipped:{total_skipped}")
     if total_errors:
         print(f"errors: {total_errors[:5]}")
+        sys.exit(1)
+    print("서버 저장 확인 완료. 사이트 새로고침 또는 자동 갱신을 기다려주세요.")
 
 
 if __name__ == '__main__':
-    main()
+    started = time.perf_counter()
+    try:
+        main()
+    finally:
+        print(f"\n총 실행 시간: {time.perf_counter() - started:.1f}초")

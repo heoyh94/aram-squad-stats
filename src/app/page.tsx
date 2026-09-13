@@ -1,4 +1,6 @@
 import SyncButton from '@/components/SyncButton'
+import GamesAutoRefresh from '@/components/GamesAutoRefresh'
+import { matchRevision } from '@/lib/syncStatus'
 import { Suspense } from 'react'
 import DashboardClient from '@/components/DashboardClient'
 import {
@@ -24,6 +26,16 @@ export default async function HomePage() {
 
   return (
     <div>
+      <GamesAutoRefresh
+        revision={
+          allGames[0]
+            ? matchRevision(
+                allGames[0].match_id,
+                allGames[0].game_results.map((result) => result.id),
+              )
+            : null
+        }
+      />
       <div className="site-intro">
         <div className="intro-copy">
           <h1>칼바람 매치 리포트</h1>
