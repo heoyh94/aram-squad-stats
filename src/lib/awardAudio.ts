@@ -27,12 +27,12 @@ interface Tone {
   type: OscillatorType
 }
 
-/** Original synthesized cues. Combined awards share the same two-second window. */
+/** Original synthesized cues. MVP takes priority when both awards are visible. */
 export function awardSoundPlan(
   awards: AwardChanges,
   durationMs = AWARD_VISIBLE_MS,
 ): Tone[] {
-  const cues = [awards.mvp && 'mvp', awards.anchor && 'anchor'].filter(Boolean)
+  const cues = [awards.mvp ? 'mvp' : awards.anchor ? 'anchor' : false].filter(Boolean)
   if (!cues.length || durationMs <= 300) return []
   const slot = (durationMs - 100) / 1000 / cues.length
   return cues.flatMap((cue, index) => {

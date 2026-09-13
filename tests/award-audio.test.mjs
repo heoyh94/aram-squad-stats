@@ -27,11 +27,10 @@ test('solo effects are distinct and all sounds end inside the popup lifetime', (
   }
 })
 
-test('combined award cues play in sequence and late or empty cues stay silent', () => {
+test('combined awards use only the full MVP cue and late or empty cues stay silent', () => {
   const plan=awardSoundPlan({mvp:true,anchor:true})
-  const first=plan.filter(t=>t.type==='triangle')
-  const second=plan.filter(t=>t.type==='sine')
-  assert.ok(Math.max(...first.map(t=>t.start+t.duration)) < Math.min(...second.map(t=>t.start)))
+  assert.deepEqual(plan,awardSoundPlan({mvp:true,anchor:false}))
+  assert.ok(plan.every(t=>t.type==='triangle'))
   assert.deepEqual(awardSoundPlan({mvp:false,anchor:false}),[])
   assert.deepEqual(awardSoundPlan({mvp:true,anchor:true},200),[])
 })
