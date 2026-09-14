@@ -3,8 +3,8 @@ ARAM Squad Stats - LCU Agent (Windows)
 롤 클라이언트에서 ARAM Mayhem(queueId 2400) 전적을 읽어 서버로 전송합니다.
 
 사용법:
-  python lcu_agent.py          # 정상 실행 (최근 8경기 확인 후 전송)
-  python lcu_agent.py --full   # 최근 20경기까지 되짚어 누락분 복구
+  python lcu_agent.py          # 마지막 서버 저장 경기 이후 미저장 경기 전송
+  python lcu_agent.py --full   # 클라이언트가 제공하는 이전 기록도 재검사
   python lcu_agent.py --debug  # 진단 모드 (API 응답 raw 출력, 서버 전송 안 함)
 
 필요:
@@ -18,6 +18,7 @@ import json
 import base64
 import argparse
 import time
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 try:
@@ -34,14 +35,15 @@ except ImportError as exc:
 
 SERVER_URL      = "https://aram4.vercel.app/api/lcu-sync"
 STATUS_URL      = "https://aram4.vercel.app/api/lcu-sync/status"
+LAST_SYNC_URL   = "https://aram4.vercel.app/api/last-sync"
 LCU_SECRET  = os.environ.get("LCU_SYNC_SECRET", "")  # 환경변수 or 직접 입력
 QUEUE_ID    = 2400   # ARAM Mayhem
 
-# 한 판 끝날 때마다 돌리는 게 기본 사용 패턴이라 좁은 구간이면 충분하다.
-# 서버가 결과 없는 기존 경기를 복구할 수 있으므로 구간이 곧 복구 창(window)이 된다.
-# 더 넓게 되짚어야 할 때는 --full 로 실행한다.
-FETCH_COUNT      = 8
-FETCH_COUNT_FULL = 20
+# 최근 N경기로 자르지 않고 서버 저장 기준까지 페이지를 넘긴다.
+# --full 은 저장 기준보다 오래된, 클라이언트가 제공하는 기록도 확인한다.
+HISTORY_PAGE_SIZE = 20
+HISTORY_MAX_PAGES = 25  # 안전 상한에 닿으면 완료로 보고하지 않는다.
+RESULT_WAIT_SECONDS = 20
 
 # gameName → (LCU puuid, Riot puuid)
 TRACKED_PLAYERS = {
@@ -115,9 +117,9 @@ def lcu_session(port: str, password: str) -> requests.Session:
     return s
 
 
-def lcu_get(session: requests.Session, path: str):
+def lcu_get(session: requests.Session, path: str, timeout=30):
     url = session.__dict__['base_url'] + path
-    r = session.get(url, timeout=30)
+    r = session.get(url, timeout=timeout)
     r.raise_for_status()
     return r.json()
 
@@ -149,15 +151,16 @@ def get_current_account(session: requests.Session):
     raise RuntimeError("계정 정보를 가져올 수 없습니다")
 
 
-def get_match_history(session: requests.Session, puuid: str, count: int = 200) -> list:
+def get_match_history(session: requests.Session, puuid: str, count: int = HISTORY_PAGE_SIZE, begin: int = 0, timeout=30) -> list:
     """매치 히스토리 - gameId 목록 반환"""
     endpoints = [
-        f'/lol-match-history/v1/products/lol/{puuid}/matches?begIndex=0&endIndex={count}',
-        f'/lol-match-history/v3/matchlist/account/{puuid}?begIndex=0&endIndex={count}',
+        f'/lol-match-history/v1/products/lol/current-summoner/matches?begIndex={begin}&endIndex={begin + count - 1}',
+        f'/lol-match-history/v1/products/lol/{puuid}/matches?begIndex={begin}&endIndex={begin + count - 1}',
+        f'/lol-match-history/v3/matchlist/account/{puuid}?begIndex={begin}&endIndex={begin + count - 1}',
     ]
     for ep in endpoints:
         try:
-            data = lcu_get(session, ep)
+            data = lcu_get(session, ep, timeout=timeout)
             if isinstance(data, dict):
                 games = data.get('games', [])
                 if isinstance(games, dict):
@@ -168,10 +171,73 @@ def get_match_history(session: requests.Session, puuid: str, count: int = 200) -
                 return data[:count]
         except Exception as e:
             print(f"  endpoint {ep} 실패: {e}")
-    return []
+    raise RuntimeError('클라이언트 전적 조회 실패. 미저장 경기 확인을 완료하지 못했습니다.')
 
 
-def get_game_detail(session: requests.Session, game_id: int) -> dict:
+def get_sync_checkpoint(session: requests.Session):
+    response = session.get(LAST_SYNC_URL, timeout=(5, 10), headers={'Cache-Control': 'no-cache'})
+    response.raise_for_status()
+    data = response.json()
+    if not isinstance(data, dict) or 'last_played_at' not in data:
+        raise ValueError('마지막 저장 경기 응답 형식 오류')
+    if not data.get('last_played_at') or not data.get('revision'):
+        return None  # 빈 DB 또는 최신 경기의 부분 저장: 시각으로 건너뛰지 않는다.
+    created = datetime.fromisoformat(data['last_played_at'].replace('Z', '+00:00'))
+    return {'gameId': data['last_match_id'], 'creation': int(created.timestamp() * 1000)}
+
+
+def collect_since_checkpoint(session, puuid, checkpoint, full=False):
+    """페이지를 넘겨 저장 기준까지 확인. 같은 페이지 반복을 완료로 오인하지 않는다."""
+    found = {}
+    reached = checkpoint is None
+    for index in range(HISTORY_MAX_PAGES):
+        page = get_match_history(session, puuid, HISTORY_PAGE_SIZE, index * HISTORY_PAGE_SIZE)
+        fresh = [g for g in page if g.get('gameId') not in found]
+        if not fresh:
+            return list(found.values()), reached
+        found.update({g['gameId']: g for g in fresh})
+        if checkpoint and any(
+            f'OC1_{g["gameId"]}' == checkpoint['gameId'] or
+            0 < int(g.get('gameCreation', 0)) <= checkpoint['creation'] for g in fresh
+        ):
+            reached = True
+            if not full:
+                break
+        if len(page) < HISTORY_PAGE_SIZE:
+            break
+    else:
+        return list(found.values()), False
+    return sorted(found.values(), key=lambda g: int(g.get('gameCreation', 0)), reverse=True), reached
+
+
+def after_checkpoint(games, checkpoint, full=False):
+    if not checkpoint or full:
+        return games
+    # 같은 시각의 경기와 시각이 없는 응답도 ID별 저장 상태를 확인한다.
+    return [g for g in games if not g.get('gameCreation') or int(g['gameCreation']) >= checkpoint['creation']]
+
+
+def wait_for_finished_game(session, puuid, game_id, games):
+    """종료 화면의 경기만 짧게 재조회. 진행 중인 경기 데이터는 사용하지 않는다."""
+    known = {g['gameId']: g for g in games}
+    deadline = time.monotonic() + RESULT_WAIT_SECONDS
+    while game_id not in known:
+        detail = get_game_detail(session, game_id, timeout=2)
+        if (len(detail.get('participants', [])) >= 10 and
+                int(detail.get('gameDuration', 0)) > 0 and
+                int(detail.get('gameCreation', 0)) > 0 and
+                all('win' in p.get('stats', {}) for p in detail['participants'])):
+            known[game_id] = detail
+            break
+        if time.monotonic() >= deadline:
+            return list(known.values()), False
+        print('  종료 경기 전적 등록 대기 중... (약 20초까지 재시도)', flush=True)
+        time.sleep(2)
+        known.update({g['gameId']: g for g in get_match_history(session, puuid, timeout=2)})
+    return list(known.values()), True
+
+
+def get_game_detail(session: requests.Session, game_id: int, timeout=30) -> dict:
     """gameId로 전체 참여자 데이터 조회"""
     endpoints = [
         f'/lol-match-history/v1/games/{game_id}',
@@ -179,7 +245,7 @@ def get_game_detail(session: requests.Session, game_id: int) -> dict:
     ]
     for ep in endpoints:
         try:
-            data = lcu_get(session, ep)
+            data = lcu_get(session, ep, timeout=timeout)
             if isinstance(data, dict) and data.get('participants'):
                 return data
         except Exception as e:
@@ -192,12 +258,16 @@ def get_completed_match_ids(session: requests.Session, games: list, secret: str)
     ids = [f'OC1_{game["gameId"]}' for game in games]
     if not ids:
         return set()
-    response = session.post(STATUS_URL, json={'secret': secret, 'match_ids': ids}, timeout=(5, 10))
-    response.raise_for_status()
-    completed = response.json().get('complete_match_ids')
-    if not isinstance(completed, list) or not all(isinstance(value, str) for value in completed):
-        raise ValueError('서버 저장 상태 응답 형식 오류')
-    return set(completed) & set(ids)
+    confirmed = set()
+    for offset in range(0, len(ids), 20):
+        batch = ids[offset:offset + 20]
+        response = session.post(STATUS_URL, json={'secret': secret, 'match_ids': batch}, timeout=(5, 10))
+        response.raise_for_status()
+        completed = response.json().get('complete_match_ids')
+        if not isinstance(completed, list) or not all(isinstance(value, str) for value in completed):
+            raise ValueError('서버 저장 상태 응답 형식 오류')
+        confirmed.update(set(completed) & set(batch))
+    return confirmed
 
 
 def pending_games(games: list, completed: set) -> list:
@@ -345,7 +415,7 @@ def run_debug(session: requests.Session, puuid: str):
 
     # 3. Mayhem 전용 확인
     print(f"\n[3] queueId {QUEUE_ID} (ARAM Mayhem) 경기")
-    all_games = get_match_history(session, puuid, count=FETCH_COUNT)
+    all_games = get_match_history(session, puuid)
     mayhem_all = [g for g in all_games if int(g.get('queueId', g.get('queue', {}).get('id', -1))) == QUEUE_ID]
     print(f"  총 {len(mayhem_all)}경기 발견")
     if mayhem_all:
@@ -410,10 +480,8 @@ def run_debug(session: requests.Session, puuid: str):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--debug', action='store_true', help='진단 모드 (서버 전송 안 함)')
-    parser.add_argument('--full', action='store_true',
-                        help=f'최근 {FETCH_COUNT_FULL}경기까지 되짚어 누락분 복구')
+    parser.add_argument('--full', action='store_true', help='클라이언트가 제공하는 이전 기록도 재검사')
     args = parser.parse_args()
-    fetch_count = FETCH_COUNT_FULL if args.full else FETCH_COUNT
 
     try:
         import urllib3
@@ -478,11 +546,40 @@ def main():
         sys.exit(1)
     server_session = requests.Session()
 
-    # 5. 매치 히스토리
-    print(f"[4] 매치 히스토리 조회 (최근 {fetch_count}경기)...")
+    print('[4] 서버의 마지막 저장 경기 확인...')
+    try:
+        checkpoint = get_sync_checkpoint(server_session)
+    except (requests.RequestException, ValueError, KeyError) as error:
+        print(f'  ✗ 마지막 저장 기준을 확인하지 못했습니다: {error}')
+        sys.exit(1)
+    if checkpoint:
+        when = datetime.fromtimestamp(checkpoint['creation'] / 1000, timezone(timedelta(hours=9)))
+        print(f'  저장 기준: {when:%Y-%m-%d %H:%M:%S} KST · {checkpoint["gameId"]}')
+    else:
+        print('  완료된 저장 기준 없음 → 제공되는 전적 전체 재검사')
+    print('  현재 계정 전적으로 저장 기준 이후 경기를 조회합니다...')
     stage_start = time.perf_counter()
-    raw_games = get_match_history(session, puuid, fetch_count)
-    print(f"  전체 {len(raw_games)}경기 · {time.perf_counter() - stage_start:.1f}초")
+    raw_games, reached = collect_since_checkpoint(session, puuid, checkpoint, args.full)
+    collection_errors = []
+    if checkpoint and raw_games and max(int(g.get('gameCreation', 0)) for g in raw_games) < checkpoint['creation']:
+        collection_errors.append('클라이언트 전적이 서버의 마지막 저장 경기보다 오래됐습니다. 최신 목록을 확인하지 못했습니다.')
+    if not reached:
+        collection_errors.append('클라이언트가 같은 전적만 반환하거나 이전 기록을 제공하지 않아 저장 기준까지 확인하지 못했습니다.')
+    phase = ''
+    try:
+        flow = lcu_get(session, '/lol-gameflow/v1/session')
+        phase = flow.get('phase', '')
+        end_id = int(flow.get('gameData', {}).get('gameId', 0))
+        if phase in ('PreEndOfGame', 'WaitingForStats', 'EndOfGame') and end_id:
+            raw_games, ready = wait_for_finished_game(session, puuid, end_id, raw_games)
+            if not ready:
+                collection_errors.append(f'OC1_{end_id}: 종료 경기 결과가 아직 준비되지 않았습니다. 저장 완료가 아닙니다.')
+        elif phase in ('InProgress', 'GameStart', 'ChampSelect'):
+            print('  클라이언트 기준 게임 진행 중: 현재 경기는 종료 결과가 준비된 뒤 수집됩니다.')
+    except requests.RequestException:
+        print('  경기 종료 상태 확인 불가. 전적 목록에 등록된 경기만 확인합니다.')
+    raw_games = after_checkpoint(raw_games, checkpoint, args.full)
+    print(f"  저장 기준 이후 확인 대상 {len(raw_games)}경기 · {time.perf_counter() - stage_start:.1f}초")
 
     # 6. Mayhem 필터 → 최근 경기 재검사 → game detail → 4인 확인
     # 서버가 game_results가 비어 있는 기존 games를 복구할 수 있으므로
@@ -507,7 +604,6 @@ def main():
     print(f"  저장 완료 {len(completed)}경기 생략 · 확인 {time.perf_counter() - stage_start:.1f}초")
     print(f"[6] 미저장 경기 상세 조회 ({len(candidates)}경기)...")
     stage_start = time.perf_counter()
-    collection_errors = []
 
     for raw in candidates:
         game_id = raw.get('gameId')
@@ -532,6 +628,11 @@ def main():
         print(f"  ✓ OC1_{game_id} 포함")
 
     print(f"  Mayhem 4인 게임: {len(games_payload)}경기 · 조회 {time.perf_counter() - stage_start:.1f}초")
+    if collection_errors:
+        print(f"errors: {collection_errors}")
+        print('  미확인 경기를 남긴 채 저장 기준을 앞당기지 않습니다. 다시 실행해주세요.')
+        sys.exit(1)
+    games_payload.sort(key=lambda game: game['gameCreation'])
 
     # payload 샘플 출력 (디버그용)
     if games_payload:
@@ -545,8 +646,8 @@ def main():
         if collection_errors:
             print(f"errors: {collection_errors}")
             sys.exit(1)
-        print("  새로 전송할 게임 없음.")
-        print("  방금 끝난 경기가 없다면 롤 클라이언트 전적에 나타난 뒤 다시 실행해주세요.")
+        print("  저장 기준 이후, 현재 전적에 등록된 미저장 4인 경기 없음.")
+        print("  방금 끝난 경기가 안 보인다면 결과 등록 대기일 수 있습니다. 롤 전적 화면을 열고 다시 실행해주세요.")
         return
 
     # 7. 서버 전송 (배치로 나눠서)
@@ -565,6 +666,7 @@ def main():
             resp = server_session.post(SERVER_URL, json={
                 'secret': LCU_SECRET,
                 'games': batch,
+                'stop_on_error': True,
             }, timeout=60)
             resp.raise_for_status()
             result = resp.json()
@@ -577,9 +679,11 @@ def main():
             print(f"{'⚠' if errors else '✓'} synced:{synced} skipped:{skipped} HTTP:{resp.status_code} · {time.perf_counter() - stage_start:.1f}초")
             if errors:
                 print(f"    errors: {errors[:3]}")
+                break
         except Exception as e:
             print(f"✗ {e}")
             total_errors.append(str(e))
+            break
 
     print(f"\n완료! 총 synced:{total_synced} / skipped:{total_skipped}")
     if total_errors:

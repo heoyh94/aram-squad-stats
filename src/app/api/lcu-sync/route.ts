@@ -50,6 +50,7 @@ interface LcuGame {
 interface LcuSyncPayload {
   secret: string
   games: LcuGame[]
+  stop_on_error?: boolean
 }
 
 // ─── Handler ──────────────────────────────────────────────────────────────────
@@ -106,6 +107,9 @@ export async function POST(request: NextRequest) {
     const errors: string[] = []
 
     for (const game of body.games) {
+      // 시간 기준으로 수집하는 에이전트는 실패한 경기보다 이후로 저장 기준이
+      // 전진하면 안 된다. 오래된 경기부터 보내고 첫 실패에서 멈춘다.
+      if (body.stop_on_error && errors.length > 0) break
       // Riot 경로와 같은 기준으로 거른다. 시크릿을 아는 클라이언트가 아무 큐,
       // 아무 시점의 경기나 밀어 넣지 못하도록 서버에서도 확인한다.
       if (!SUPPORTED_QUEUES.includes(game.queueId)) { skipped++; continue }
